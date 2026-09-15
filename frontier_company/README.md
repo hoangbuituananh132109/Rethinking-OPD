@@ -21,7 +21,8 @@ batch 2 rồi quy khác biệt cho queue/controller.
 
 ```bash
 cd /nlp/anhhbt/Rethinking-OPD
-python -c 'import verl' || python -m pip install -e ./verl --no-deps
+PYTHONPATH="$PWD/verl:$PWD" python3 -c 'import verl.trainer.main_ppo, frontier' || \
+  python3 -m pip install -e ./verl --no-deps
 ```
 
 Chỉ dùng `pip` khi environment đang thiếu package. Runner đặt toàn bộ Hugging
