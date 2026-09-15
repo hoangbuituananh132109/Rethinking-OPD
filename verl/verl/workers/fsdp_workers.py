@@ -489,9 +489,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        # Actor offload remains controlled by its dedicated FSDP2 policy. The
+        # reference model now honors param_offload so high-memory GPU nodes can
+        # keep it resident while memory-constrained profiles retain the old
+        # default (param_offload=True).
+        ref_param_offload = bool(fsdp_config.get("param_offload", True))
+        cpu_offload = None if role == "actor" or not ref_param_offload else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
@@ -517,7 +520,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
             else:
-                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+                cpu_offload = (
+                    None if role == "actor" or not ref_param_offload else CPUOffloadPolicy(pin_memory=True)
+                )
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
@@ -1757,7 +1762,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=model_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=OmegaConf.to_container(
+                    OmegaConf.create(self.config.model.get("override_config", {}))
+                ).get("attn_implementation", "flash_attention_2"),
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1783,13 +1790,19 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 sync_module_states=True,
-                cpu_offload=CPUOffload(offload_params=True),
+                cpu_offload=CPUOffload(
+                    offload_params=bool(config.model.fsdp_config.get("param_offload", True))
+                ),
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
             )
         elif config.strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
-            cpu_offload = CPUOffloadPolicy(pin_memory=True)
+            cpu_offload = (
+                CPUOffloadPolicy(pin_memory=True)
+                if bool(config.model.fsdp_config.get("param_offload", True))
+                else None
+            )
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
                 "offload_policy": cpu_offload,
@@ -1803,14 +1816,21 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             raise NotImplementedError(f"Unknown strategy: {config.strategy}")
         return reward_module
 
-    def _compute_entropy_safe(self, logits, chunk_size=4096):
+    def _compute_entropy_safe(self, logits, chunk_size=None):
+        import os
         import torch.nn.functional as F
+        # FRONTIER_TEACHER_ENTROPY_CHUNK_V1: this changes only how many rows
+        # are materialized at once; the entropy formula and values are unchanged.
+        if chunk_size is None:
+            chunk_size = int(os.environ.get("FRONTIER_TEACHER_ENTROPY_CHUNK_SIZE", "4096"))
+        if chunk_size <= 0:
+            raise ValueError("FRONTIER_TEACHER_ENTROPY_CHUNK_SIZE must be positive")
         # logits: [..., vocab_size]
         original_shape = logits.shape
         vocab_size = original_shape[-1]
         
         # Flatten to [-1, vocab_size]
-        logits_flat = logits.view(-1, vocab_size)
+        logits_flat = logits.reshape(-1, vocab_size)
         
         entropy_list = []
         for i in range(0, logits_flat.size(0), chunk_size):

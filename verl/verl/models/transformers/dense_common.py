@@ -83,6 +83,8 @@ def forward_with_torch_backend(
     cache_position: Optional[torch.LongTensor] = None,
     logits_to_keep: int | torch.Tensor = 0,
     temperature: float = 1.0,
+    frontier_selected_ids: Optional[torch.LongTensor] = None,
+    frontier_force_logits: bool = False,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -105,6 +107,17 @@ def forward_with_torch_backend(
     if not return_dict:
         raise NotImplementedError("forward_with_torch_backend has to return_dict")
 
+    # The first OPD actor pass discovers its own top-k IDs under no-grad.  It
+    # may use ordinary logits; subsequent train updates use the chunked path.
+    if frontier_force_logits:
+        logits = self.lm_head(hidden_states)
+        return CausalLMOutputForPPO(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
     # Loss calculations
     if labels is not None:
         rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
@@ -114,10 +127,11 @@ def forward_with_torch_backend(
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
     fused_linear_for_ppo = FusedLinearForPPO()
+    selected_ids = rolled_labels if frontier_selected_ids is None else frontier_selected_ids
     log_probs, entropy = fused_linear_for_ppo.forward(
         hidden_states=hidden_states,
         vocab_weights=self.lm_head.weight,
-        input_ids=rolled_labels,
+        input_ids=selected_ids,
         temperature=temperature,
     )
 

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import torch
+from types import MethodType
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 
@@ -236,10 +237,12 @@ def patch_forward_with_backends(
         forward_with_triton_backend_function = forward_with_triton_backend
 
     if fused_kernels_backend == "triton":
-        model.__class__.forward = forward_with_triton_backend_function
+        # FRONTIER_INSTANCE_FUSED_FORWARD_V1: do not mutate the global HF
+        # class; actor and teacher can coexist in the same Ray worker.
+        model.forward = MethodType(forward_with_triton_backend_function, model)
         print(f"Using Triton backend for fused kernels in {model.__class__.__name__}")
     elif fused_kernels_backend == "torch":
-        model.__class__.forward = forward_with_torch_backend_function
+        model.forward = MethodType(forward_with_torch_backend_function, model)
         print(f"Using Torch backend for fused kernels in {model.__class__.__name__}")
     else:
         raise ValueError(f"Unsupported fused_kernels_backend: {fused_kernels_backend}. Choose 'triton' or 'torch'.")

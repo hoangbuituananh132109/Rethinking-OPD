@@ -60,6 +60,12 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
+from frontier.early_route import (
+    empty_only_student_outputs,
+    scatter_partial_tensors,
+    teacher_compute_mask,
+)
+
 
 @dataclass
 class ResourcePoolManager:
@@ -253,6 +259,17 @@ def compute_advantage(
             adv_kwargs["true_reward_score"] = data.batch["true_reward_score"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+
+        # FRONTIER_TWO_BRANCH_V1 diagnostics use tensors already computed for OPD;
+        # this does not trigger another student or teacher forward.
+        for frontier_key in (
+            "student_top_k_log_probs",
+            "teacher_on_student_log_probs",
+            "frontier_queue_visit_phase",
+            "frontier_teacher_compute_mask",
+        ):
+            if frontier_key in data.batch:
+                adv_kwargs[frontier_key] = data.batch[frontier_key]
 
         # calculate advantage estimator
         res = adv_estimator_fn(**adv_kwargs)
@@ -1030,6 +1047,14 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # FRONTIER_ZERO_DEFER_CURRICULUM_V3: the sampler must expose
+                # ordinary/revisit state before rollout repeat and actor update.
+                curriculum_sampler = self.train_dataloader.sampler
+                if isinstance(curriculum_sampler, AbstractCurriculumSampler) and hasattr(
+                    curriculum_sampler, "annotate_batch"
+                ):
+                    batch = curriculum_sampler.annotate_batch(batch)
+
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
@@ -1039,8 +1064,18 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                # FRONTIER_BALANCED_ROLLOUT_V1: optional systems-only ordering.
+                # False spreads every prompt group across rollout DP ranks; the
+                # default True preserves the exact upstream contiguous order.
+                import os
+
+                rollout_repeat_interleave = (
+                    os.getenv("FRONTIER_ROLLOUT_REPEAT_INTERLEAVE", "True").lower()
+                    in ("1", "true", "yes", "on")
+                )
                 gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    repeat_times=self.config.actor_rollout_ref.rollout.n,
+                    interleave=rollout_repeat_interleave,
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1087,7 +1122,10 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n,
+                        interleave=rollout_repeat_interleave,
+                    )
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1102,47 +1140,108 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # FRONTIER_ZERO_DEFER_EARLY_ROUTE_V4: correctness is
+                    # available from the rule verifier before any student-top-k
+                    # or teacher forward. Initial 0/G, revisit G/G, and padding
+                    # therefore bypass OPD computation entirely.
+                    frontier_early_route = bool(
+                        self.config.algorithm.get("frontier_queue", {}).get("enable", False)
+                    )
+                    frontier_true_reward_tensor = None
+                    frontier_reward_extra_infos_dict = None
+                    frontier_teacher_compute_mask = None
+                    if frontier_early_route:
+                        if self.config.reward_model.launch_reward_fn_async:
+                            raise RuntimeError("E5 verifier-first routing requires synchronous rule reward")
+                        with marked_timer("frontier_early_verifier", timing_raw, color="yellow"):
+                            frontier_true_reward_tensor, frontier_reward_extra_infos_dict = compute_reward(
+                                batch, self.reward_fn
+                            )
+                        frontier_teacher_compute_mask = teacher_compute_mask(
+                            batch.non_tensor_batch["uid"],
+                            batch.batch["frontier_queue_visit_phase"],
+                            frontier_true_reward_tensor,
+                        )
+                        batch.batch["frontier_teacher_compute_mask"] = frontier_teacher_compute_mask.to(
+                            batch.batch["responses"].device
+                        )
+                        metrics["frontier/teacher_scored_row_frac_preopd"] = float(
+                            frontier_teacher_compute_mask.float().mean().cpu().item()
+                        )
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            with marked_timer("compute_log_prob", timing_raw, color="blue"):
-                                # First forward, get student top k ids and log probs
-                                print("First forward, get student top k ids and log probs")
-                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-
-                                # if "entropys" in old_log_prob.batch.keys():
-                                #    old_log_prob.batch.pop("entropys")
-                                batch = batch.union(old_log_prob)
-
-                            # Get Top-K parameters from config
                             top_k = self.config.actor_rollout_ref.rollout.get("log_prob_top_k", 0)
                             strategy = self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu")
                             kl_estimator = self.config.actor_rollout_ref.rollout.get("kl_estimator", "k1")
-                            reward_weight_mode = self.config.actor_rollout_ref.rollout.get("reward_weight_mode", "student_p")
+                            reward_weight_mode = self.config.actor_rollout_ref.rollout.get(
+                                "reward_weight_mode", "student_p"
+                            )
+                            if frontier_early_route and (top_k <= 0 or strategy != "only_stu"):
+                                raise RuntimeError(
+                                    "E5 early route is verified only for top-k>0 and top_k_strategy=only_stu"
+                                )
 
-                            # pass global_steps and is_plot config to rm_wg
                             batch.meta_info["global_steps"] = self.global_steps
                             batch.meta_info["is_plot"] = self.config.trainer.get("is_plot", False)
-                            teacher_temperature = self.config.actor_rollout_ref.rollout.get("teacher_temperature", 1.0)
-
                             batch.meta_info["log_prob_top_k"] = top_k
                             batch.meta_info["top_k_strategy"] = strategy
                             batch.meta_info["kl_estimator"] = kl_estimator
                             batch.meta_info["reward_weight_mode"] = reward_weight_mode
-                            batch.meta_info["teacher_temperature"] = teacher_temperature
-                            
-                            with marked_timer("compute_rm_score", timing_raw, color="magenta"):
-                                teacher_data = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(teacher_data)
+                            batch.meta_info["teacher_temperature"] = self.config.actor_rollout_ref.rollout.get(
+                                "teacher_temperature", 1.0
+                            )
 
-                            if top_k > 0:
-                                # All distillation reward calculation is now moved to GPU worker (actor_rollout_wg)
-                                # for efficiency and to reduce CPU tensor ops.
-                                # compute_distillation_reward computes S_on_T and then rm_scores.
-                                with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
-                                    distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
-                                    batch = batch.union(distillation_output)
-                        
+                            active_indices = None
+                            if frontier_early_route:
+                                active_indices = torch.nonzero(
+                                    frontier_teacher_compute_mask, as_tuple=False
+                                ).reshape(-1)
+                            if active_indices is not None and int(active_indices.numel()) == 0:
+                                print(
+                                    "FRONTIER_ZERO_DEFER_EARLY_ROUTE_V4: skipped student top-k and "
+                                    "teacher scoring for every row"
+                                )
+                                batch = batch.union(
+                                    DataProto.from_dict(
+                                        tensors=empty_only_student_outputs(batch.batch["responses"], top_k)
+                                    )
+                                )
+                            else:
+                                partial = active_indices is not None and int(active_indices.numel()) < len(batch)
+                                opd_batch = batch[active_indices.cpu()] if partial else batch
+                                original_keys = set(batch.batch.keys())
+                                with marked_timer("compute_log_prob", timing_raw, color="blue"):
+                                    print(
+                                        "First forward, get student top k ids and log probs; "
+                                        f"rows={len(opd_batch)}/{len(batch)}"
+                                    )
+                                    old_log_prob = self.actor_rollout_wg.compute_log_prob(opd_batch)
+                                    opd_batch = opd_batch.union(old_log_prob)
+                                with marked_timer("compute_rm_score", timing_raw, color="magenta"):
+                                    teacher_data = self.rm_wg.compute_rm_score(opd_batch)
+                                    opd_batch = opd_batch.union(teacher_data)
+                                if top_k > 0:
+                                    with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
+                                        distillation_output = self.actor_rollout_wg.compute_distillation_reward(
+                                            opd_batch
+                                        )
+                                        opd_batch = opd_batch.union(distillation_output)
+                                if partial:
+                                    new_tensors = {
+                                        key: value
+                                        for key, value in opd_batch.batch.items()
+                                        if key not in original_keys
+                                    }
+                                    batch = batch.union(
+                                        DataProto.from_dict(
+                                            tensors=scatter_partial_tensors(
+                                                len(batch), active_indices, new_tensors
+                                            )
+                                        )
+                                    )
+
                         # Plot overlapping tokens for Reverse KL
                         if (self.global_steps == 1 or self.global_steps % 10 == 0) and "student_valid_counts" in batch.batch.keys():
                             try:
@@ -1243,7 +1342,11 @@ class RayPPOTrainer:
                              batch.batch.pop("overlap_counts")
 
 
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if frontier_early_route:
+                            reward_tensor = batch.batch["rm_scores"] if self.use_rm else frontier_true_reward_tensor
+                            reward_extra_infos_dict = dict(frontier_reward_extra_infos_dict or {})
+                            reward_extra_infos_dict["true_reward_score"] = frontier_true_reward_tensor
+                        elif self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
@@ -1407,6 +1510,35 @@ class RayPPOTrainer:
                                 teacher_on_stu_log_probs = batch.batch.get("teacher_on_student_log_probs", None)  # (BS, SeqLen, K)
                                 teacher_log_probs = batch.batch.get("teacher_top_k_log_probs", None)  # (BS, SeqLen, K)
                                 student_on_tch_log_probs = batch.batch.get("student_log_probs_on_teacher_ids", None)  # (BS, SeqLen, K)
+
+
+                                # FRONTIER_SHARED_OPD_DIAGNOSTICS: detached and
+                                # common to E2/E3/E4. Conditional KL/JS are on
+                                # the student's top-k support, not full-vocab.
+                                if student_log_probs is not None and teacher_on_stu_log_probs is not None:
+                                    valid_token_mask = response_mask.bool()
+                                    student_lp_f = student_log_probs.float()
+                                    teacher_lp_f = teacher_on_stu_log_probs.float()
+                                    student_mass = student_lp_f.exp().sum(dim=-1).clamp(0.0, 1.0)
+                                    teacher_mass = teacher_lp_f.exp().sum(dim=-1).clamp(0.0, 1.0)
+                                    student_cond_log = torch.log_softmax(student_lp_f, dim=-1)
+                                    teacher_cond_log = torch.log_softmax(teacher_lp_f, dim=-1)
+                                    student_cond = student_cond_log.exp()
+                                    teacher_cond = teacher_cond_log.exp()
+                                    mixture_log = (0.5 * (student_cond + teacher_cond)).clamp_min(1e-12).log()
+                                    kl_t_s = (teacher_cond * (teacher_cond_log - student_cond_log)).sum(dim=-1)
+                                    kl_s_t = (student_cond * (student_cond_log - teacher_cond_log)).sum(dim=-1)
+                                    js = 0.5 * (
+                                        (teacher_cond * (teacher_cond_log - mixture_log)).sum(dim=-1)
+                                        + (student_cond * (student_cond_log - mixture_log)).sum(dim=-1)
+                                    )
+                                    if valid_token_mask.any():
+                                        metrics["val-opd/student_topk_mass_mean"] = student_mass[valid_token_mask].mean().item()
+                                        metrics["val-opd/teacher_reachable_mass_mean"] = teacher_mass[valid_token_mask].mean().item()
+                                        metrics["val-opd/teacher_unreachable_mass_mean"] = (1.0 - teacher_mass[valid_token_mask]).mean().item()
+                                        metrics["val-opd/topk_cond_kl_teacher_student"] = kl_t_s[valid_token_mask].mean().item()
+                                        metrics["val-opd/topk_cond_kl_student_teacher"] = kl_s_t[valid_token_mask].mean().item()
+                                        metrics["val-opd/topk_cond_js"] = js[valid_token_mask].mean().item()
 
                                 if top_k > 0 and advantages.dim() == 3:
                                     adv_k = advantages.shape[-1]  # K or 2K
@@ -2253,12 +2385,26 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                        # FRONTIER_ZERO_DEFER_SKIP_EMPTY_UPDATE_V3: a batch made
+                        # entirely of deferred/retired/padding rows has no
+                        # training credit. Do not step the optimizer or LR
+                        # scheduler for that batch.
+                        queue_cfg = self.config.algorithm.get("frontier_queue", {})
+                        queue_credit = batch.batch.get("frontier_metric__training_credit_spent_frac")
+                        skip_empty_queue_update = (
+                            bool(queue_cfg.get("enable", False))
+                            and queue_credit is not None
+                            and float(queue_credit.detach().sum().cpu().item()) <= 0.0
+                        )
+                        if skip_empty_queue_update:
+                            metrics["frontier/actor_update_skipped_no_credit"] = 1.0
+                        else:
+                            # update actor
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -2357,3 +2503,14 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        # FRONTIER_QUEUE_NATURAL_END_V1: a dynamic sampler may yield fewer
+        # revisits than its declared upper bound. Save the last completed
+        # on-policy update instead of silently ending without a checkpoint.
+        queue_cfg = self.config.algorithm.get("frontier_queue", {})
+        if queue_cfg and bool(queue_cfg.get("enable", False)) and self.global_steps > 1:
+            self.global_steps -= 1
+            print(f"E5 queue exhausted naturally at completed step {self.global_steps}")
+            self._save_checkpoint()
+            progress_bar.close()
+            return

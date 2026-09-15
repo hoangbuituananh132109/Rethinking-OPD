@@ -6,6 +6,7 @@
 **/*.ckpt
 **/outputs
 **/*.tar.gz
+**/*.bak
 **/playground
 **/wandb
 

@@ -83,6 +83,107 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    # FRONTIER_GRAD_INTERACTION_DIAGNOSTICS_V1
+    def _frontier_gradient_interaction(self, micro_batch, temperature, loss_scale_factor):
+        """Measure two native branches without stepping or retaining the train graph.
+
+        This runs after the real combined optimizer step. It recomputes the same
+        frozen rollout microbatch twice at the post-update parameters, restores RNG,
+        and leaves .grad empty. The selected FSDP parameter is fixed by model order
+        and size bounds so the reported cosine is a stable parameter-subset probe.
+        """
+        cfg = self.config.get("frontier_grad_diagnostics", {})
+        min_numel = int(cfg.get("min_param_numel", 100000))
+        max_numel = int(cfg.get("max_param_numel", 80000000))
+        candidates = [
+            (name, param) for name, param in self.actor_module.named_parameters()
+            if param.requires_grad and min_numel <= param.numel() <= max_numel
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"gradient diagnostic found no parameter in [{min_numel}, {max_numel}] elements"
+            )
+        parameter_name, parameter = candidates[-1]
+        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+        response_mask = model_inputs.get("frontier_policy_loss_mask", model_inputs["response_mask"])
+        opd_advantages = model_inputs["advantages"]
+        grpo_advantages = model_inputs.get("frontier_grpo_advantages")
+        if grpo_advantages is None or opd_advantages.dim() != 3:
+            raise RuntimeError("gradient diagnostic requires native OPD [B,T,K] and GRPO [B,T]")
+        top_k = opd_advantages.shape[-1]
+        top_k_ids = model_inputs.get("union_top_k_ids", model_inputs.get("student_top_k_ids"))
+        if top_k_ids is None:
+            raise RuntimeError("gradient diagnostic has no student/union top-k token IDs")
+        policy_loss_fn = get_policy_loss_fn(self.config.policy_loss.get("loss_mode", "vanilla"))
+        format_mask = model_inputs.get("format_mask")
+
+        def branch_backward(branch):
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            _, sampled_log_prob, _, topk_log_probs = self._forward_micro_batch(
+                model_inputs,
+                temperature=temperature,
+                calculate_entropy=False,
+                top_k=top_k,
+                student_top_k_ids=top_k_ids,
+            )
+            if branch == "opd":
+                loss, _ = policy_loss_fn(
+                    old_log_prob=topk_log_probs.detach(),
+                    log_prob=topk_log_probs,
+                    advantages=opd_advantages,
+                    response_mask=response_mask,
+                    loss_agg_mode=self.config.loss_agg_mode,
+                    config=self.config,
+                    rollout_is_weights=None,
+                    format_mask=format_mask,
+                )
+            else:
+                loss, _ = policy_loss_fn(
+                    old_log_prob=sampled_log_prob.detach(),
+                    log_prob=sampled_log_prob,
+                    advantages=grpo_advantages,
+                    response_mask=response_mask,
+                    loss_agg_mode=self.config.loss_agg_mode,
+                    config=self.config,
+                    rollout_is_weights=None,
+                    format_mask=format_mask,
+                )
+            (loss * loss_scale_factor).backward()
+            if parameter.grad is None:
+                raise RuntimeError(f"gradient diagnostic parameter has no {branch} gradient: {parameter_name}")
+            return loss.detach(), parameter.grad.detach().float().clone()
+
+        devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices, enabled=True):
+            opd_loss, g_opd = branch_backward("opd")
+            grpo_loss, g_grpo = branch_backward("grpo")
+
+        local = torch.stack(
+            [g_grpo.square().sum(), g_opd.square().sum(), (g_grpo * g_opd).sum()]
+        ).to(dtype=torch.float64)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
+        grpo_sq, opd_sq, dot = local
+        eps = torch.finfo(torch.float64).eps
+        grpo_norm = grpo_sq.clamp_min(0).sqrt()
+        opd_norm = opd_sq.clamp_min(0).sqrt()
+        cosine = dot / (grpo_norm * opd_norm).clamp_min(eps)
+        combined_norm = (grpo_sq + opd_sq + 2 * dot).clamp_min(0).sqrt()
+        del g_grpo, g_opd
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        return {
+            "frontier_grad/grpo_norm": grpo_norm.item(),
+            "frontier_grad/opd_norm": opd_norm.item(),
+            "frontier_grad/norm_ratio_grpo_opd": (grpo_norm / opd_norm.clamp_min(eps)).item(),
+            "frontier_grad/cosine": cosine.item(),
+            "frontier_grad/dot": dot.item(),
+            "frontier_grad/combined_norm": combined_norm.item(),
+            "frontier_grad/grpo_loss_probe": grpo_loss.item(),
+            "frontier_grad/opd_loss_probe": opd_loss.item(),
+            "frontier_grad/parameter_numel": float(parameter.numel()),
+            "frontier_grad/measured": 1.0,
+        }, parameter_name
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -172,6 +273,29 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                need_logits = top_k > 0
+                fused_topk_ids = None
+                use_fused_selected = self.use_fused_kernels and need_logits and student_top_k_ids is not None
+                if use_fused_selected:
+                    if student_top_k_ids.ndim != 3:
+                        raise RuntimeError("fused OPD actor requires padded student_top_k_ids [B,T,K]")
+                    if student_top_k_ids.shape[1] != seqlen:
+                        full_student_top_k_ids = torch.zeros(
+                            (batch_size, seqlen, top_k), dtype=student_top_k_ids.dtype,
+                            device=student_top_k_ids.device,
+                        )
+                        full_student_top_k_ids[:, -response_length-1:-1, :] = student_top_k_ids
+                        student_top_k_ids = full_student_top_k_ids
+                    fused_topk_ids = student_top_k_ids.view(-1, top_k)[indices]
+                    fused_selected_ids = torch.cat(
+                        [input_ids_rmpad_rolled.squeeze(0).unsqueeze(-1), fused_topk_ids], dim=-1
+                    ).unsqueeze(0)
+                    extra_args["frontier_selected_ids"] = fused_selected_ids
+                elif self.use_fused_kernels and need_logits:
+                    # FRONTIER_FUSED_TOPK_ACTOR_V2: discovery is no-grad and
+                    # needs ordinary logits to choose the student's own top-k.
+                    extra_args["frontier_force_logits"] = True
+
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -180,12 +304,18 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-                
-                need_logits = top_k > 0
 
-                if self.use_fused_kernels and not need_logits:
-                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
-                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                if self.use_fused_kernels and not (need_logits and not use_fused_selected):
+                    fused_log_probs = output.log_probs.squeeze(0)
+                    entropy_rmpad = output.entropy.squeeze(0)
+                    if need_logits:
+                        # FRONTIER_FUSED_TOPK_ACTOR_V1: column 0 is the sampled token;
+                        # columns 1..K are the unchanged OPD candidate token log-probs.
+                        log_probs = fused_log_probs[:, 0]
+                        topk_log_probs = fused_log_probs[:, 1:]
+                        topk_ids = fused_topk_ids
+                    else:
+                        log_probs = fused_log_probs
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -196,19 +326,15 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         inplace_backward = False
                     
-                    # Optimization: when top_k > 0, compute log_softmax once and gather both
-                    # log_probs and topk_log_probs to avoid duplicate computation and gradient
-                    # issues from inplace operations
+                    # FRONTIER_GATHERED_LOGPROBS_V1: exact selected-token
+                    # log-softmax without materializing [tokens, vocab] log_probs_all.
                     need_topk = top_k > 0
                     if need_topk:
-                        # Compute log_softmax once for both target and topk tokens
-                        # Note: we don't use inplace_backward here to ensure correct gradients
-                        # when both log_probs and topk_log_probs are needed
-                        log_probs_all = torch.log_softmax(logits_rmpad, dim=-1)
-                        # Gather log_probs for target tokens
-                        log_probs = log_probs_all.gather(
+                        log_normalizer = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
+                        target_logits = logits_rmpad.gather(
                             dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)
-                        ).squeeze(-1)
+                        )
+                        log_probs = (target_logits - log_normalizer).squeeze(-1)
                     else:
                         log_probs = logprobs_from_logits(
                             logits=logits_rmpad,
@@ -225,7 +351,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
                     
-                    if need_topk:
+                    if need_topk and not use_fused_selected:
                         if student_top_k_ids is not None:
                              # Use specific IDs (from rollout)
                              topk_ids = student_top_k_ids
@@ -267,8 +393,8 @@ class DataParallelPPOActor(BasePPOActor):
                              # Legacy/Resample behavior
                              _, topk_ids = torch.topk(logits_rmpad, k=top_k, dim=-1)
 
-                        # Use pre-computed log_probs_all (always available when need_topk=True)
-                        topk_log_probs = log_probs_all.gather(dim=-1, index=topk_ids)
+                        selected_topk_logits = logits_rmpad.gather(dim=-1, index=topk_ids)
+                        topk_log_probs = selected_topk_logits - log_normalizer
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -363,16 +489,14 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     
-                    # Optimization: when top_k > 0, compute log_softmax once and gather both
-                    # log_probs and topk_log_probs to avoid duplicate computation
+                    # FRONTIER_GATHERED_LOGPROBS_V1: padded equivalent.
                     need_topk = top_k > 0
                     if need_topk:
-                        # Compute log_softmax once for both target and topk tokens
-                        log_probs_all = torch.log_softmax(logits, dim=-1)
-                        # Gather log_probs for target tokens (responses)
-                        log_probs = log_probs_all.gather(
+                        log_normalizer = torch.logsumexp(logits, dim=-1, keepdim=True)
+                        target_logits = logits.gather(
                             dim=-1, index=micro_batch["responses"].unsqueeze(-1)
-                        ).squeeze(-1)
+                        )
+                        log_probs = (target_logits - log_normalizer).squeeze(-1)
                     else:
                         log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     
@@ -389,8 +513,8 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                              _, topk_ids = torch.topk(logits, k=top_k, dim=-1)
                         
-                        # Use pre-computed log_probs_all (always available when need_topk=True)
-                        topk_log_probs = log_probs_all.gather(dim=-1, index=topk_ids)
+                        selected_topk_logits = logits.gather(dim=-1, index=topk_ids)
+                        topk_log_probs = selected_topk_logits - log_normalizer
 
             return entropy, log_probs, topk_ids, topk_log_probs
 
@@ -753,6 +877,17 @@ class DataParallelPPOActor(BasePPOActor):
 
         if "format_mask" in data.batch.keys():
             select_keys.append("format_mask") # (bsz, 1)
+
+        # FRONTIER_TWO_BRANCH_V1 tensors and row-wise logging diagnostics.
+        if "frontier_grpo_advantages" in data.batch.keys():
+            select_keys.append("frontier_grpo_advantages")
+        # FRONTIER_ZERO_DEFER_ACTIVE_LOSS_MASK_V3 keeps no-credit rows out
+        # of token-mean denominators while preserving their rollout logs.
+        if "frontier_policy_loss_mask" in data.batch.keys():
+            select_keys.append("frontier_policy_loss_mask")
+        for key in data.batch.keys():
+            if key.startswith("frontier_metric__"):
+                select_keys.append(key)
         
         # Include student_top_k_log_probs if present (for top-k distillation)
         if "student_top_k_log_probs" in data.batch.keys():
@@ -802,11 +937,21 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
+                # FRONTIER_GRAD_INTERACTION_DIAGNOSTICS_V1: retain only one
+                # eligible microbatch reference for a sparse post-update probe.
+                diagnostic_micro_batch = None
+                diagnostic_scale_factor = None
+                diagnostic_cfg = self.config.get("frontier_grad_diagnostics", {})
+                diagnostic_interval = int(diagnostic_cfg.get("interval", 0))
+                diagnostic_step = int(data.meta_info.get("global_steps", 0))
+
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
+                    response_mask = model_inputs.get(
+                        "frontier_policy_loss_mask", model_inputs["response_mask"]
+                    )
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -823,47 +968,55 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     
-                    # Check if we have 3D advantages (top-k sampling case)
-                    # If so, we need to recompute top-k log probs for correct gradient
+                    # FRONTIER_TWO_BRANCH_V1: a single forward produces both
+                    # sampled-token and top-k log-probs. They feed separate native losses.
+                    frontier_grpo_advantages = model_inputs.get("frontier_grpo_advantages", None)
                     if advantages.dim() == 3:
                         top_k = advantages.shape[-1]
-                        # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
                         student_top_k_ids = None
                         if "union_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["union_top_k_ids"]
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, sampled_log_prob, _, topk_log_probs = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
                         log_prob_for_loss = topk_log_probs
-                        
                     else:
-                        _, log_prob, *_ = self._forward_micro_batch(
+                        entropy, sampled_log_prob, *_ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                         )
-                        log_prob_for_loss = log_prob
+                        log_prob_for_loss = sampled_log_prob
+
+                    if frontier_grpo_advantages is not None:
+                        if advantages.dim() != 3 or frontier_grpo_advantages.dim() != 2:
+                            raise RuntimeError("frontier hybrid requires OPD [B,T,K] and GRPO [B,T]")
+                        if advantages.shape[:2] != frontier_grpo_advantages.shape:
+                            raise RuntimeError("frontier hybrid branch shapes do not align")
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
                         format_mask = model_inputs["format_mask"]
             
 
-                    # for fully_async_policy recipe
+                    # FRONTIER_TWO_BRANCH_V1 is synchronous/on-policy. Refuse the
+                    # fully-async recipe rather than silently changing scientific semantics.
+                    if frontier_grpo_advantages is not None and (
+                        hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs
+                    ):
+                        raise RuntimeError("frontier hybrid does not support stale fully-async rollout log-probs")
+
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
                     else:
                         if on_policy:
                             print("on_policy")
-                            # For on-policy (ppo_epochs=1), use current policy as "old"
-                            # log_prob_for_loss is already 3D for top-k case
                             old_log_prob = log_prob_for_loss.detach()
+                            frontier_grpo_old_log_prob = sampled_log_prob.detach()
                         else:
                             print("off_policy")
-                            # For off-policy, use stored log probs
-                            # For 3D top-k case, use stored log probs (union or student)
                             if advantages.dim() == 3:
                                 if "union_top_k_log_probs" in model_inputs:
                                     old_log_prob = model_inputs["union_top_k_log_probs"]
@@ -873,6 +1026,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     old_log_prob = model_inputs["old_log_probs"]
                             else:
                                 old_log_prob = model_inputs["old_log_probs"]
+                            frontier_grpo_old_log_prob = model_inputs["old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
@@ -890,10 +1044,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # Compute policy loss (any function is expected to return 2 values)
+                    # Main branch: unchanged upstream OPD top-k policy loss.
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
-                        log_prob=log_prob_for_loss,  # 3D for top-k, 2D otherwise
+                        log_prob=log_prob_for_loss,
                         advantages=advantages,
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
@@ -902,6 +1056,59 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    # Second branch: unchanged native sampled-token GRPO policy loss.
+                    if frontier_grpo_advantages is not None:
+                        if rollout_is_weights is not None:
+                            raise RuntimeError("frontier hybrid rollout correction is not validated")
+                        opd_pg_loss = pg_loss
+                        grpo_pg_loss, grpo_pg_metrics = policy_loss_fn(
+                            old_log_prob=frontier_grpo_old_log_prob,
+                            log_prob=sampled_log_prob,
+                            advantages=frontier_grpo_advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=None,
+                            format_mask=format_mask,
+                        )
+                        pg_loss = opd_pg_loss + grpo_pg_loss
+                        micro_batch_metrics["frontier/opd_pg_loss"] = (
+                            opd_pg_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["frontier/grpo_pg_loss"] = (
+                            grpo_pg_loss.detach().item() * loss_scale_factor
+                        )
+                        for name, value in grpo_pg_metrics.items():
+                            micro_batch_metrics[f"frontier/grpo_{name.split('/')[-1]}"] = value
+
+                        metric_names = (
+                            "grpo_native_rms", "opd_native_rms", "native_rms_ratio",
+                            "grpo_effective_rms", "opd_effective_rms",
+                            "grpo_token_l2_proxy", "opd_token_l2_proxy", "token_l2_proxy_ratio",
+                            "grpo_weight_mean", "grpo_active_frac", "opd_weight_mean",
+                            "opd_active_frac", "both_active_frac", "neither_active_frac",
+                            "group_success_rate_mean", "group_all_wrong_frac",
+                            "group_all_correct_frac", "compatibility_mean", "disagreement_mean",
+                            "diagnostic_unit",
+                            "student_topk_mass_mean", "teacher_reachable_mass_mean",
+                            "teacher_unreachable_mass_mean", "compatibility_gate_pass_frac",
+                            "topk_cond_kl_teacher_student", "topk_cond_kl_student_teacher",
+                            "topk_cond_js",
+                            # FRONTIER_ZERO_DEFER_QUEUE_METRICS_V3
+                            "group_success_count", "group_size", "queue_visit_phase",
+                            "teacher_scored_frac",
+                            "first_zero_deferred_frac", "revisit_all_correct_retired_frac",
+                            "queue_padding_frac", "grpo_eligible_before_queue_frac",
+                            "opd_eligible_before_queue_frac", "training_credit_spent_frac",
+                        )
+                        for metric_name in metric_names:
+                            tensor_key = f"frontier_metric__{metric_name}"
+                            if tensor_key in model_inputs:
+                                value = model_inputs[tensor_key].float().mean()
+                                micro_batch_metrics[f"frontier/{metric_name}"] = (
+                                    value.detach().item() * loss_scale_factor
+                                )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -928,6 +1135,22 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+
+                    if (
+                        bool(diagnostic_cfg.get("enable", False))
+                        and diagnostic_interval > 0
+                        and diagnostic_step > 0
+                        and (
+                            diagnostic_step == int(diagnostic_cfg.get("first_step", -1))
+                            or diagnostic_step % diagnostic_interval == 0
+                        )
+                        and diagnostic_micro_batch is None
+                        and frontier_grpo_advantages is not None
+                    ):
+                        both = model_inputs.get("frontier_metric__both_active_frac")
+                        if both is not None and float(both.detach().sum().cpu().item()) > 0.0:
+                            diagnostic_micro_batch = micro_batch
+                            diagnostic_scale_factor = loss_scale_factor
                     loss.backward()
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
@@ -936,5 +1159,16 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                if diagnostic_micro_batch is not None:
+                    diagnostic_metrics, diagnostic_parameter = self._frontier_gradient_interaction(
+                        diagnostic_micro_batch, temperature, diagnostic_scale_factor
+                    )
+                    append_to_dict(metrics, diagnostic_metrics)
+                    print(
+                        "FRONTIER_GRAD_INTERACTION_DIAGNOSTICS_V1 "
+                        f"step={diagnostic_step} parameter={diagnostic_parameter} "
+                        f"metrics={diagnostic_metrics}",
+                        flush=True,
+                    )
         self.actor_optimizer.zero_grad()
         return metrics

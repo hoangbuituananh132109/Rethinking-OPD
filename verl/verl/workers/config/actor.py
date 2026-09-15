@@ -120,6 +120,8 @@ class ActorConfig(BaseConfig):
     data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    # FRONTIER_GRAD_DIAGNOSTICS_CONFIG_V1: logging-only diagnostics; no train semantics.
+    frontier_grad_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

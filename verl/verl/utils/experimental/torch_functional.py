@@ -31,7 +31,11 @@ def _fused_linear_for_ppo_fwd(
     probs = logits.softmax(dim=-1)
     log_probs = logits.log_softmax(dim=-1)
 
-    token_log_probs = log_probs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
+    # FRONTIER_MULTI_SELECTED_LOGPROBS_V1: input_ids may be [T] or [T, K].
+    gather_ids = input_ids.unsqueeze(-1) if input_ids.ndim == 1 else input_ids
+    token_log_probs = log_probs.gather(-1, gather_ids)
+    if input_ids.ndim == 1:
+        token_log_probs = token_log_probs.squeeze(-1)
     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
 
     return token_log_probs.to(orig_dtype), entropy.to(orig_dtype)
@@ -53,10 +57,17 @@ def _fused_linear_for_ppo_bwd(
 
     dlogits = 0
 
-    # Gradient from log_probs
+    # Gradient from one or many selected log-probabilities.  For K IDs,
+    # d/dz sum_k g_k log p(id_k) = scatter_sum(g_k) - p * sum_k(g_k).
     if dlog_probs is not None:
-        one_hot_input = torch.zeros_like(logits).scatter_(-1, input_ids.unsqueeze(-1), 1)
-        dlogits += dlog_probs.to(torch.float32).unsqueeze(-1) * (one_hot_input - probs)
+        if input_ids.ndim == 1:
+            gather_ids = input_ids.unsqueeze(-1)
+            selected_grads = dlog_probs.to(torch.float32).unsqueeze(-1)
+        else:
+            gather_ids = input_ids
+            selected_grads = dlog_probs.to(torch.float32)
+        dlogits = torch.zeros_like(logits).scatter_add_(-1, gather_ids, selected_grads)
+        dlogits -= probs * selected_grads.sum(dim=-1, keepdim=True)
 
     # Gradient from entropy
     if dentropy is not None:
@@ -90,7 +101,9 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
 
         orig_batch_size = -1
         if orig_ndim == 3:
-            assert input_ids.ndim == 2, f"input_ids shape doesn't match, {hidden_states.shape} {input_ids.shape}"
+            assert input_ids.ndim in (2, 3), (
+                f"input_ids shape doesn't match, {hidden_states.shape} {input_ids.shape}"
+            )
             orig_batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.flatten(0, 1)
             input_ids = input_ids.flatten(0, 1)
@@ -99,7 +112,8 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
 
         # Allocate memory for outputs
         output_requires_grad = hidden_states.requires_grad or vocab_weights.requires_grad
-        log_probs = hidden_states.new_zeros(T, requires_grad=output_requires_grad)
+        log_prob_shape = (T,) if input_ids.ndim == 1 else (T, input_ids.shape[-1])
+        log_probs = hidden_states.new_zeros(log_prob_shape, requires_grad=output_requires_grad)
         entropy = hidden_states.new_zeros(T, requires_grad=output_requires_grad)
 
         # Perform forward one chunk at a time
@@ -117,7 +131,10 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
 
         # Cast the output back to the original input dimension
         if orig_ndim == 3:
-            log_probs = log_probs.view(orig_batch_size, -1)
+            if input_ids.ndim == 1:
+                log_probs = log_probs.view(orig_batch_size, -1)
+            else:
+                log_probs = log_probs.view(orig_batch_size, -1, input_ids.shape[-1])
             entropy = entropy.view(orig_batch_size, -1)
 
         ctx.save_for_backward(hidden_states, vocab_weights, input_ids)
@@ -141,7 +158,11 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
         # Here orig_ndim refers to the orig_ndim of hidden_states
         if orig_ndim == 3:
             if dlog_probs is not None:
-                dlog_probs = dlog_probs.flatten()
+                dlog_probs = (
+                    dlog_probs.flatten()
+                    if input_ids.ndim == 1
+                    else dlog_probs.flatten(0, 1)
+                )
             if dentropy is not None:
                 dentropy = dentropy.flatten()
 

@@ -888,40 +888,253 @@ def compute_token_reward_direct_plus_grpo_advantage(
     config: Optional[AlgoConfig] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare native OPD and GRPO branches without broadcasting GRPO over K.
+
+    FRONTIER_TWO_BRANCH_V1: ``advantages`` remains the native 3D OPD branch.
+    The native 2D GRPO branch is carried separately to the actor, which adds
+    the two scalar policy losses. This preserves both upstream objectives.
     """
-    Combine token_reward_direct and GRPO outcome advantage.
-    adv = direct_adv + weight * grpo_adv
-    
-    Args:
-        token_level_rewards: (bs, response_length)
-        response_mask: (bs, response_length)
-        index: (bs,) group index
-        config: AlgoConfig
-    """
-    # 1. Compute direct advantage
+    from frontier.torch_ops import (
+        grpo_outer_row_weights,
+        group_mean_rows,
+        masked_rms,
+        opd_outer_group_weights,
+    )
+
     direct_adv, _ = compute_token_reward_direct_advantage(
         token_level_rewards, response_mask, config, **kwargs
     )
-    
-    # 2. Compute GRPO advantage
-    # Use true_reward_score if available (raw reward without KL penalty), otherwise use token_level_rewards
     rewards_for_grpo = kwargs.get("true_reward_score", token_level_rewards)
-    
     norm_adv_by_std_in_grpo = config.norm_adv_by_std_in_grpo if config else True
     grpo_adv, _ = compute_grpo_outcome_advantage(
-        rewards_for_grpo, response_mask, index, 
+        rewards_for_grpo,
+        response_mask,
+        index,
         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        config=config
+        config=config,
     )
-    
-    # 3. Combine
-    weight = config.grpo_outcome_weight if config else 1.0
-    
-    combined_adv = direct_adv + weight * grpo_adv
-    # Since token_reward_direct sets returns=adv, we follow suit
-    combined_returns = combined_adv.clone()
-    
-    return combined_adv, combined_returns, {"token_level_advantage_direct": direct_adv}
+
+    if direct_adv.dim() != 3 or grpo_adv.dim() != 2:
+        raise RuntimeError(
+            "FRONTIER_TWO_BRANCH_V1 expected OPD [B,T,K] and GRPO [B,T], "
+            f"got {tuple(direct_adv.shape)} and {tuple(grpo_adv.shape)}"
+        )
+    if direct_adv.shape[:2] != grpo_adv.shape or grpo_adv.shape != response_mask.shape:
+        raise RuntimeError("hybrid branch batch/token shapes do not align")
+
+    static_cfg = config.get("frontier_static", {}) if config is not None else {}
+    normalize_branches = bool(static_cfg.get("normalize_branches", False)) if static_cfg else False
+    dynamic_cfg = config.get("frontier", {}) if config is not None else {}
+    dynamic_enabled = bool(dynamic_cfg.get("enable", False)) if dynamic_cfg else False
+    if dynamic_enabled and not normalize_branches:
+        raise RuntimeError("E4 requires E3 branch normalization")
+
+    opd_rms = masked_rms(direct_adv, response_mask)
+    grpo_rms = masked_rms(grpo_adv, response_mask)
+    if normalize_branches:
+        opd_for_loss = direct_adv / opd_rms.clamp_min(1e-8)
+        grpo_for_loss = grpo_adv / grpo_rms.clamp_min(1e-8)
+    else:
+        opd_for_loss = direct_adv
+        weight = config.grpo_outcome_weight if config else 1.0
+        grpo_for_loss = grpo_adv * weight
+
+    batch_size = response_mask.shape[0]
+    extra = {
+        "token_level_advantage_direct": direct_adv,
+        "frontier_grpo_advantages": grpo_for_loss,
+        "frontier_metric__grpo_native_rms": grpo_rms.expand(batch_size),
+        "frontier_metric__opd_native_rms": opd_rms.expand(batch_size),
+        "frontier_metric__native_rms_ratio": (grpo_rms / opd_rms.clamp_min(1e-8)).expand(batch_size),
+    }
+
+    if dynamic_enabled:
+        student_lp = kwargs.get("student_top_k_log_probs")
+        teacher_lp = kwargs.get("teacher_on_student_log_probs")
+        if student_lp is None or teacher_lp is None:
+            raise RuntimeError("E4 requires current student and teacher log-probs on student top-k IDs")
+        if student_lp.shape != direct_adv.shape or teacher_lp.shape != direct_adv.shape:
+            raise RuntimeError("E4 top-k diagnostics do not match native OPD advantage shape")
+
+        # Detached OPD diagnostics from the already-computed distributions.
+        # ``token_c`` is probability-weighted support overlap: teacher mass on
+        # the student's top-k IDs. It is not the discrete top-k ID overlap
+        # ratio, which upstream logs separately as val-topk/overlap_ratio.
+        student_lp_f = student_lp.float()
+        teacher_lp_f = teacher_lp.float()
+        token_student_mass = student_lp_f.exp().sum(dim=-1).clamp_(0.0, 1.0)
+        token_c = teacher_lp_f.exp().sum(dim=-1).clamp_(0.0, 1.0)
+        denom = response_mask.float().sum(dim=-1).clamp_min(1.0)
+        row_student_mass = (token_student_mass * response_mask.float()).sum(dim=-1) / denom
+        row_c = (token_c * response_mask.float()).sum(dim=-1) / denom
+
+        # D: teacher-conditioned absolute student/teacher log-ratio in that
+        # same reachable top-k region. This is controller-only; native OPD is untouched.
+        student_cond_log = torch.log_softmax(student_lp_f, dim=-1)
+        teacher_cond_log = torch.log_softmax(teacher_lp_f, dim=-1)
+        student_cond = student_cond_log.exp()
+        teacher_cond = teacher_cond_log.exp()
+        token_d = ((student_lp_f - teacher_lp_f).abs() * teacher_cond).sum(dim=-1)
+        row_d = (token_d * response_mask.float()).sum(dim=-1) / denom
+
+        # These are conditional/truncated divergences inside the reachable
+        # student top-k support, not full-vocabulary KL. JS is symmetric and
+        # bounded by ln(2), which makes it especially useful for plots.
+        token_kl_t_s = (teacher_cond * (teacher_cond_log - student_cond_log)).sum(dim=-1)
+        token_kl_s_t = (student_cond * (student_cond_log - teacher_cond_log)).sum(dim=-1)
+        mixture_log = (0.5 * (teacher_cond + student_cond)).clamp_min(1e-12).log()
+        token_js = 0.5 * (
+            (teacher_cond * (teacher_cond_log - mixture_log)).sum(dim=-1)
+            + (student_cond * (student_cond_log - mixture_log)).sum(dim=-1)
+        )
+        row_kl_t_s = (token_kl_t_s * response_mask.float()).sum(dim=-1) / denom
+        row_kl_s_t = (token_kl_s_t * response_mask.float()).sum(dim=-1) / denom
+        row_js = (token_js * response_mask.float()).sum(dim=-1) / denom
+
+        group_student_mass = group_mean_rows(row_student_mass, index)
+        group_c = group_mean_rows(row_c, index)
+        group_d = group_mean_rows(row_d, index)
+        group_kl_t_s = group_mean_rows(row_kl_t_s, index)
+        group_kl_s_t = group_mean_rows(row_kl_s_t, index)
+        group_js = group_mean_rows(row_js, index)
+
+        grpo_w, p, k, group_size = grpo_outer_row_weights(
+            rewards_for_grpo,
+            index,
+            response_mask=response_mask,
+            gamma=float(dynamic_cfg.get("grpo_gamma", 1.0)),
+            min_weight=float(dynamic_cfg.get("grpo_min", 0.0)),
+            max_weight=float(dynamic_cfg.get("grpo_max", 1.0)),
+        )
+        opd_tau_c = float(dynamic_cfg.get("opd_tau_c", 0.5))
+        opd_w = opd_outer_group_weights(
+            group_c,
+            group_d,
+            tau_c=opd_tau_c,
+            kappa=float(dynamic_cfg.get("opd_kappa", 0.1)),
+            min_weight=float(dynamic_cfg.get("opd_min", 0.0)),
+            max_weight=float(dynamic_cfg.get("opd_max", 1.0)),
+        )
+
+        # FRONTIER_ZERO_DEFER_CURRICULUM_V3 preserves both native losses and
+        # applies only an outer row mask.  Ordinary 0/G is deferred without an
+        # update; its one fresh revisit uses E4 unless it has become G/G, in
+        # which case it is retired.  Masked padding prevents drop_last from
+        # discarding an odd final queue item.
+        grpo_eligible_before_queue = grpo_w > 0
+        # FRONTIER_ZERO_DEFER_EARLY_ROUTE_V4: unscored rows use inert
+        # placeholders and must be logged as unscored, not OPD-ineligible.
+        teacher_scored = kwargs.get("frontier_teacher_compute_mask")
+        if teacher_scored is None:
+            teacher_scored = torch.ones_like(k, dtype=torch.bool)
+        else:
+            teacher_scored = teacher_scored.to(device=k.device, dtype=torch.bool).reshape(-1)
+            if teacher_scored.shape != k.shape:
+                raise RuntimeError("E5 teacher-compute mask does not align with rollout rows")
+        opd_eligible_before_queue = (opd_w > 0) & teacher_scored
+        queue_cfg = config.get("frontier_queue", {}) if config is not None else {}
+        queue_enabled = bool(queue_cfg.get("enable", False)) if queue_cfg else False
+        zero = torch.zeros_like(k, dtype=torch.bool)
+        first_zero_deferred = zero
+        revisit_all_correct_retired = zero
+        queue_padding = zero
+        queue_visit_phase = torch.zeros_like(k, dtype=torch.long)
+        if queue_enabled:
+            queue_visit_phase = kwargs.get("frontier_queue_visit_phase")
+            if queue_visit_phase is None:
+                raise RuntimeError("E5 queue requires frontier_queue_visit_phase before actor update")
+            queue_visit_phase = queue_visit_phase.to(device=k.device, dtype=torch.long).reshape(-1)
+            if queue_visit_phase.shape != k.shape:
+                raise RuntimeError(
+                    "E5 queue visit phase does not align with rollout rows: "
+                    f"phase={tuple(queue_visit_phase.shape)} groups={tuple(k.shape)}"
+                )
+            if not torch.all((queue_visit_phase >= 0) & (queue_visit_phase <= 2)):
+                raise RuntimeError("E5 queue visit phase must be ordinary=0, revisit=1, or padding=2")
+            first_zero_deferred = (queue_visit_phase == 0) & (k == 0)
+            revisit_all_correct_retired = (queue_visit_phase == 1) & (k == group_size)
+            queue_padding = queue_visit_phase == 2
+            queue_suppressed = first_zero_deferred | revisit_all_correct_retired | queue_padding
+            grpo_w = grpo_w.masked_fill(queue_suppressed, 0.0)
+            opd_w = opd_w.masked_fill(queue_suppressed, 0.0)
+
+        opd_for_loss = opd_for_loss * opd_w.to(opd_for_loss.dtype)[:, None, None]
+        grpo_for_loss = grpo_for_loss * grpo_w.to(grpo_for_loss.dtype)[:, None]
+
+        grpo_active = grpo_w > 0
+        opd_active = opd_w > 0
+        # FRONTIER_ZERO_DEFER_ACTIVE_LOSS_MASK_V3 excludes no-credit rows
+        # from token-mean denominators, so a mixed batch does not dilute the
+        # native E4 loss of its active prompt.
+        training_credit = grpo_active | opd_active
+        extra["frontier_policy_loss_mask"] = (
+            response_mask * training_credit.to(response_mask.dtype)[:, None]
+        )
+        extra.update(
+            {
+                "frontier_metric__grpo_weight_mean": grpo_w,
+                "frontier_metric__grpo_active_frac": grpo_active.float(),
+                "frontier_metric__opd_weight_mean": opd_w,
+                "frontier_metric__opd_active_frac": opd_active.float(),
+                "frontier_metric__both_active_frac": (grpo_active & opd_active).float(),
+                "frontier_metric__neither_active_frac": (~grpo_active & ~opd_active).float(),
+                "frontier_metric__group_success_rate_mean": p,
+                "frontier_metric__group_success_count": k.float(),
+                "frontier_metric__group_size": group_size.float(),
+                "frontier_metric__group_all_wrong_frac": (k == 0).float(),
+                "frontier_metric__group_all_correct_frac": (k == group_size).float(),
+                "frontier_metric__queue_visit_phase": queue_visit_phase.float(),
+                "frontier_metric__teacher_scored_frac": teacher_scored.float(),
+                "frontier_metric__first_zero_deferred_frac": first_zero_deferred.float(),
+                "frontier_metric__revisit_all_correct_retired_frac": revisit_all_correct_retired.float(),
+                "frontier_metric__queue_padding_frac": queue_padding.float(),
+                "frontier_metric__grpo_eligible_before_queue_frac": grpo_eligible_before_queue.float(),
+                "frontier_metric__opd_eligible_before_queue_frac": opd_eligible_before_queue.float(),
+                "frontier_metric__training_credit_spent_frac": (grpo_active | opd_active).float(),
+                "frontier_metric__compatibility_mean": group_c,
+                "frontier_metric__disagreement_mean": group_d,
+                "frontier_metric__diagnostic_unit": torch.ones_like(group_c),
+                "frontier_metric__student_topk_mass_mean": group_student_mass,
+                "frontier_metric__teacher_reachable_mass_mean": group_c,
+                "frontier_metric__teacher_unreachable_mass_mean": 1.0 - group_c,
+                "frontier_metric__compatibility_gate_pass_frac": (group_c >= opd_tau_c).float(),
+                "frontier_metric__topk_cond_kl_teacher_student": group_kl_t_s,
+                "frontier_metric__topk_cond_kl_student_teacher": group_kl_s_t,
+                "frontier_metric__topk_cond_js": group_js,
+            }
+        )
+
+    # Cheap coefficient diagnostics after static normalization and any dynamic
+    # outer weighting. These do not change either native objective. The token
+    # L2 proxy exposes the extra K axis in OPD; it is still not a parameter-
+    # gradient norm because the log-softmax/model Jacobian comes afterwards.
+    def _token_coefficient_l2(value: torch.Tensor) -> torch.Tensor:
+        squared = value.float().pow(2)
+        if squared.dim() == 3:
+            squared = squared.sum(dim=-1)
+        valid = squared.masked_select(response_mask.bool())
+        if valid.numel() == 0:
+            return torch.zeros((), dtype=value.dtype, device=value.device)
+        return valid.mean().sqrt().to(dtype=value.dtype).detach()
+
+    grpo_effective_rms = masked_rms(grpo_for_loss, response_mask)
+    opd_effective_rms = masked_rms(opd_for_loss, response_mask)
+    grpo_token_l2 = _token_coefficient_l2(grpo_for_loss)
+    opd_token_l2 = _token_coefficient_l2(opd_for_loss)
+    extra.update(
+        {
+            "frontier_metric__grpo_effective_rms": grpo_effective_rms.expand(batch_size),
+            "frontier_metric__opd_effective_rms": opd_effective_rms.expand(batch_size),
+            "frontier_metric__grpo_token_l2_proxy": grpo_token_l2.expand(batch_size),
+            "frontier_metric__opd_token_l2_proxy": opd_token_l2.expand(batch_size),
+            "frontier_metric__token_l2_proxy_ratio": (
+                grpo_token_l2 / opd_token_l2.clamp_min(1e-8)
+            ).expand(batch_size),
+        }
+    )
+
+    extra["frontier_grpo_advantages"] = grpo_for_loss
+    return opd_for_loss, opd_for_loss.clone(), extra
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
